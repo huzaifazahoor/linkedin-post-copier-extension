@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "LinkedIn Post Copier",
+  "version": "1.0.0",
+  "description": "Copy your LinkedIn posts as clean text with reactions, comments, reposts, and impressions.",
+  "permissions": ["activeTab", "scripting", "clipboardWrite"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Copy LinkedIn posts"
+  }
+}
