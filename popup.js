@@ -1,62 +1,67 @@
 const btn = document.getElementById('copyBtn');
+const countInput = document.getElementById('count');
+const skipInput = document.getElementById('skipReposts');
 const statusEl = document.getElementById('status');
-const output = document.getElementById('output');
-const copyAgain = document.getElementById('copyAgain');
 
-// A fresh click keeps the browser's user-gesture, so this copy is not blocked.
-copyAgain.addEventListener('click', () => {
-  output.focus();
-  output.select();
-  const ok = document.execCommand('copy');
-  if (ok) {
-    copyAgain.textContent = 'Copied';
-    setTimeout(() => { copyAgain.textContent = 'Copy text'; }, 1500);
-  } else {
-    navigator.clipboard.writeText(output.value)
-      .then(() => { copyAgain.textContent = 'Copied'; })
-      .catch(() => setStatus('Clipboard blocked. Select the text and press Ctrl+C.', 'bad'));
-  }
-});
+const BTN_LABEL = 'Copy posts';
+let resetTimer = null;
 
-// execCommand works reliably in extension popups; Clipboard API is the fallback.
+function setStatus(msg, type) {
+  statusEl.textContent = msg;
+  statusEl.className = type || '';
+}
+
+// Reads the box. Returns null for "all", a number, or NaN if invalid.
+function readCount() {
+  const raw = countInput.value.trim();
+  if (raw === '') return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : NaN;
+}
+
+// Tries the modern Clipboard API first, which Windows may keep in Win+V history.
+// Falls back to the old hidden text box method if that fails.
 async function copyText(text) {
-  output.value = text;
-  output.style.display = 'block';
-  copyAgain.style.display = 'block';
-  output.focus();
-  output.select();
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    console.warn('[PostCopier] clipboard.writeText failed, using fallback:', e);
+  }
+  const box = document.createElement('textarea');
+  box.value = text;
+  box.setAttribute('readonly', '');
+  box.style.position = 'fixed';
+  box.style.left = '-9999px';
+  document.body.appendChild(box);
+  box.focus();
+  box.select();
   let ok = false;
   try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
-  if (!ok) {
-    try { await navigator.clipboard.writeText(text); ok = true; } catch (e) { ok = false; }
-  }
+  box.remove();
   return ok;
 }
 
-function setStatus(msg, type = '') {
-  statusEl.textContent = msg;
-  statusEl.className = type;
-}
-
 // Runs inside the LinkedIn page. Must be self-contained.
-function extractPosts(skipReposts) {
+function extractPosts(skipReposts, limit) {
   const posts = new Map();
   const cards = document.querySelectorAll('[role="listitem"][componentkey^="update-card-focus"]');
 
-  cards.forEach(card => {
+  for (const card of cards) {
+    if (limit && posts.size >= limit) break;
+
     const all = card.innerText;
-    if (skipReposts && /reposted this/.test(all)) return;
+    if (skipReposts && /reposted this/.test(all)) continue;
 
     const box = card.querySelector('[data-testid="expandable-text-box"]');
-    if (!box) return;
+    if (!box) continue;
 
     const link = card.querySelector('a[href*="/analytics/post-summary/"]');
     const id = link ? link.href : card.getAttribute('componentkey');
-    if (posts.has(id)) return;
+    if (posts.has(id)) continue;
 
     const clone = box.cloneNode(true);
-    clone.querySelectorAll('button').forEach(b => b.remove()); // drop "… more"
-    // A detached clone ignores <br> in innerText, so turn each <br> into a real newline.
+    clone.querySelectorAll('button').forEach(b => b.remove());
     clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
     const text = clone.textContent
       .replace(/\u00a0/g, ' ')
@@ -65,16 +70,25 @@ function extractPosts(skipReposts) {
       .trim();
 
     const num = re => { const m = all.match(re); return m ? m[1] : '0'; };
-    const r = all.match(/and ([\d,]+) others? reacted/);
-    const reactions = r ? Number(r[1].replace(/,/g, '')) + 1 : (/reacted/.test(all) ? 1 : 0);
-    const age = num(/^(\d+(?:h|d|w|mo|yr?))$/m);
 
-    posts.set(id, { age, text, reactions,
-      comments: num(/([\d,]+) comments?/),
-      reposts: num(/([\d,]+) reposts?/),
+    // LinkedIn shows counts as bare numbers inside the action buttons.
+    // An empty count is a zero-width space, so treat "no digits" as 0.
+    const btnCount = selector => {
+      const btn = card.querySelector(selector);
+      if (!btn) return '0';
+      const m = btn.textContent.replace(/\u200b/g, '').match(/[\d.,]+[KM]?/i);
+      return m ? m[0] : '0';
+    };
+
+    posts.set(id, {
+      age: num(/^(\d+(?:h|d|w|mo|yr?))$/m),
+      text,
+      reactions: btnCount('button[aria-label^="Reaction button state"]'),
+      comments: btnCount('button[aria-label="Comment"]'),
+      reposts: btnCount('button[aria-label="Repost"]'),
       impressions: num(/([\d,]+) impressions/)
     });
-  });
+  }
 
   const list = [...posts.values()];
   const out = list.map((p, i) =>
@@ -85,20 +99,31 @@ function extractPosts(skipReposts) {
   return { count: list.length, out };
 }
 
-btn.addEventListener('click', async () => {
+async function run() {
+  const limit = readCount();
+  if (Number.isNaN(limit)) {
+    setStatus('Enter a whole number like 1 or 5, or leave it empty.', 'bad');
+    countInput.focus();
+    return;
+  }
+
+  clearTimeout(resetTimer);
   btn.disabled = true;
-  setStatus('Reading posts...');
+  btn.classList.remove('done');
+  btn.textContent = 'Copying...';
+  setStatus('', '');
+
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab || !/^https:\/\/www\.linkedin\.com\//.test(tab.url || '')) {
-      setStatus('Open a LinkedIn page first.', 'bad');
+      setStatus('Open your LinkedIn activity page first.', 'bad');
       return;
     }
 
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractPosts,
-      args: [document.getElementById('skipReposts').checked]
+      args: [skipInput.checked, limit]
     });
 
     if (!result || result.count === 0) {
@@ -106,16 +131,31 @@ btn.addEventListener('click', async () => {
       return;
     }
 
-    const ok = await copyText(result.out);
-    const n = `${result.count} post${result.count === 1 ? '' : 's'}`;
-    if (ok) {
-      setStatus(`Found ${n}. If paste is empty, click Copy text.`, 'ok');
-    } else {
-      setStatus(`Found ${n}, but the clipboard was blocked. Press Ctrl+C to copy the text below.`, 'bad');
+    if (!(await copyText(result.out))) {
+      setStatus('The browser blocked the copy. Try again.', 'bad');
+      return;
     }
+
+    const n = `${result.count} post${result.count === 1 ? '' : 's'}`;
+    if (limit && result.count < limit) {
+      setStatus(`Copied ${n}. Only ${result.count} loaded, scroll down for more.`, 'ok');
+    } else {
+      setStatus(`Copied ${n}.`, 'ok');
+    }
+    btn.textContent = 'Copied';
+    btn.classList.add('done');
+    resetTimer = setTimeout(() => {
+      btn.textContent = BTN_LABEL;
+      btn.classList.remove('done');
+    }, 2000);
   } catch (err) {
     setStatus('Copy failed: ' + err.message, 'bad');
   } finally {
     btn.disabled = false;
+    if (!btn.classList.contains('done')) btn.textContent = BTN_LABEL;
   }
-});
+}
+
+btn.addEventListener('click', run);
+countInput.addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
+countInput.focus();
